@@ -79,16 +79,58 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            return report
+
+        survived_claims = []
+        contradiction_split = False
+
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str):
+                continue
+
+            if ctx.saw(text):
+                survived_claims.append(claim)
+            elif " và " in text:
+                parts = text.split(" và ", 1)
+                left, right = parts[0], parts[1]
+                if ctx.saw(left) and ctx.saw(right):
+                    doc_left = None
+                    doc_right = None
+                    if ctx.corpus:
+                        for doc in ctx.corpus.docs:
+                            if doc.body in ctx.observed_text:
+                                lines = doc.body.splitlines()
+                                if doc_left is None and any(left in line for line in lines):
+                                    doc_left = doc.doc_id
+                                if doc_right is None and any(right in line for line in lines):
+                                    doc_right = doc.doc_id
+                    if doc_left and doc_right and doc_left != doc_right:
+                        survived_claims.append({"text": left, "doc_id": doc_left})
+                        survived_claims.append({"text": right, "doc_id": doc_right})
+                        contradiction_split = True
+                        report["abstain"] = True
+
+        if not survived_claims:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Theo kết quả tra cứu, hiện không đủ căn cứ để kết luận câu trả lời."
+            return report
+
+        report["claims"] = survived_claims
+        seen_docs = set()
+        citations = []
+        for c in survived_claims:
+            d = c.get("doc_id")
+            if isinstance(d, str) and d and d not in seen_docs:
+                seen_docs.add(d)
+                citations.append(d)
+        report["citations"] = sorted(citations)
+        if contradiction_split:
+            report["abstain"] = True
+        return report
